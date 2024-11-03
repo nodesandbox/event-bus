@@ -16,5 +16,14 @@
     "architecture"
   ],
   "author": "Abdou-Raouf ATARMLA <achilleatarmla@gmail.com>",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "amqplib": "^0.10.3",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.1",
+    "@types/uuid": "^9.0.1",
+    "typescript": "^5.0.4"
+  }
 }
