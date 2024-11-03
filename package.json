@@ -1,0 +1,20 @@
+{
+  "name": "@digitaltg/event-but",
+  "version": "0.1.0",
+  "description": "A lightweight library to overwrap the way event are handled in nodejs using modern tools",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://ada.gouv.tg/MicroHub/event-bus.git"
+  },
+  "keywords": [
+    "event",
+    "event-bus",
+    "nodejs",
+    "event-driven",
+    "architecture"
+  ],
+  "author": "Abdou-Raouf ATARMLA <achilleatarmla@gmail.com>",
+  "license": "ISC"
+}
