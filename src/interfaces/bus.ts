@@ -7,6 +7,7 @@ export interface EventBusOptions {
     exchange?: string;
     exchangeType?: 'topic' | 'direct' | 'fanout';
     deadLetterExchange?: string;
+    retryExchange?: string;
   };
   consumer?: {
     prefetch?: number;
