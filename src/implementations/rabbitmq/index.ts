@@ -1,1 +1,1 @@
-export * from './rabbitmq-event-bus4';
+export * from './rabbitmq-event-bus';
