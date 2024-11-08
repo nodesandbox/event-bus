@@ -1,6 +1,3 @@
-import { EventType } from "./event-type";
-
-
 export interface EventMetadata {
   id: string;                
   time: string;             
@@ -11,8 +8,8 @@ export interface EventMetadata {
   correlationId?: string;
 }
 
-export interface CloudEvent<T = unknown> {
+export interface CloudEvent<T = unknown, E extends string = string> {
   metadata: EventMetadata;   
-  type: EventType;          
+  type: E;          
   data: T;                  
 }
