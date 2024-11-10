@@ -1,151 +1,47 @@
 import { Channel, Connection, connect, ConsumeMessage } from "amqplib";
 import { v4 as uuid } from "uuid";
-import { EventBus, EventBusOptions, PublishOptions, SubscribeOptions } from "../../interfaces";
+import { EventBus, EventBusOptions, PublishOptions, SubscribeOptions, ValidatedEventBusOptions } from "../../interfaces";
+import { MessageStore } from "./stores/message-store";
+import { IdempotencyStore } from "./stores/indempotency";
+import { ConnectionHandler } from "./handlers/connection-handler";
+import { MessageHandler } from "./handlers/message-handler";
+import { DeadLetterHandler } from "./handlers/dl-handler";
 import { CloudEvent } from "../../types";
-
-// Custom Error Classes
-class MessageProcessingError extends Error {
-    constructor(message: string, public readonly originalError: Error) {
-        super(message);
-        this.name = "MessageProcessingError";
-    }
-}
-
-class RetryableError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = "RetryableError";
-    }
-}
-
-interface DeadLetterDetails {
-    messageId: string;
-    failureReason: string;
-    retryCount: number;
-    timestamp: string;
-    originalExchange: string;
-    originalRoutingKey: string;
-    content: string;
-    headers: Record<string, any>;
-    error?: Error;
-}
-
-class MessageStore {
-    private messages: Map<
-        string,
-        {
-            content: Buffer;
-            routingKey: string;
-            options: any;
-            timestamp: number;
-        }
-    > = new Map();
-
-    add(routingKey: string, content: Buffer, options: any): void {
-        const messageId = options.messageId || uuid();
-        this.messages.set(messageId, {
-            content,
-            routingKey,
-            options,
-            timestamp: Date.now(),
-        });
-    }
-
-    getAll(): Array<{
-        routingKey: string;
-        content: Buffer;
-        options: any;
-        timestamp: number;
-    }> {
-        return Array.from(this.messages.values());
-    }
-
-    clear(): void {
-        this.messages.clear();
-    }
-}
-
-class IdempotencyStore {
-    private processedMessages: Map<
-        string,
-        {
-            timestamp: number;
-            result?: any;
-        }
-    > = new Map();
-
-    private readonly TTL_MS = 24 * 60 * 60 * 1000; // 24 heures
-
-    constructor() {
-        // Nettoyer les anciens messages périodiquement
-        setInterval(() => this.cleanup(), 60 * 60 * 1000); // Toutes les heures
-    }
-
-    async markAsProcessed(messageId: string, result?: any): Promise<void> {
-        this.processedMessages.set(messageId, {
-            timestamp: Date.now(),
-            result,
-        });
-    }
-
-    async hasBeenProcessed(
-        messageId: string
-    ): Promise<{ processed: boolean; result?: any }> {
-        const entry = this.processedMessages.get(messageId);
-        if (!entry) return { processed: false };
-        return { processed: true, result: entry.result };
-    }
-
-    private cleanup(): void {
-        const now = Date.now();
-        for (const [messageId, { timestamp }] of this.processedMessages.entries()) {
-            if (now - timestamp > this.TTL_MS) {
-                this.processedMessages.delete(messageId);
-            }
-        }
-    }
-}
-
+import { MessageProcessingError } from "./errors";
+import { validateAndMergeOptions } from "../utils/bus-options-validator";
 
 export class RabbitMQEventBus<E extends string = string> implements EventBus<E> {
     private connection?: Connection;
     private channel?: Channel;
-    private readonly options: Required<EventBusOptions>;
+    private readonly options: ValidatedEventBusOptions;
     private isInitialized = false;
     private reconnectAttempts = 0;
-    private messageStore: MessageStore = new MessageStore();
-    private boundQueues: Set<string> = new Set();
+    private messageStore: MessageStore;
+    private boundQueues: Set<string>;
     private idempotencyStore: IdempotencyStore;
+    
+    
+    private connectionHandler: ConnectionHandler;
+    private messageHandler?: MessageHandler<E>;
+    private deadLetterHandler?: DeadLetterHandler;
 
-    // Constants
     private readonly MAX_RETRIES = 3;
-    private readonly RETRY_DELAYS = [1000, 5000, 15000]; // Progressive delays in ms
-    private readonly RECONNECT_DELAY = 5000; // 5 seconds
+    private readonly RETRY_DELAYS = [1000, 5000, 15000];
+    private readonly RECONNECT_DELAY = 5000;
     private readonly MAX_RECONNECT_ATTEMPTS = 10;
-    private readonly DLQ_RETENTION = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
+    private readonly DLQ_RETENTION = 7 * 24 * 60 * 60 * 1000;
     private readonly QUEUE_MAX_LENGTH = 10000;
 
     constructor(options: EventBusOptions) {
+        this.options = validateAndMergeOptions(options);
+        this.messageStore = new MessageStore();
+        this.boundQueues = new Set();
         this.idempotencyStore = new IdempotencyStore();
-        this.options = {
-            connection: {
-                exchange: "events",
-                exchangeType: "topic",
-                deadLetterExchange: "events.dlx",
-                retryExchange: "events.retry",
-                ...options.connection,
-            },
-            consumer: {
-                prefetch: 1,
-                autoAck: false,
-                ...options.consumer,
-            },
-            producer: {
-                persistent: true,
-                mandatory: true,
-                ...options.producer,
-            },
-        };
+        
+        this.connectionHandler = new ConnectionHandler(
+            this.reconnect.bind(this),
+            this.recreateChannel.bind(this)
+        );
     }
 
     private validateState(): void {
@@ -161,71 +57,17 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
         try {
             await this.connect();
             await this.setupExchangesAndQueues();
+            await this.initializeHandlers();
             this.setupEventHandlers();
+            
             this.isInitialized = true;
             console.log("RabbitMQ EventBus initialized successfully");
 
-            // Try to republish stored messages after initialization
             await this.republishStoredMessages();
         } catch (error) {
             console.error("Failed to initialize RabbitMQ EventBus:", error);
             throw error;
         }
-    }
-
-    private async republishStoredMessages(): Promise<void> {
-        if (!this.channel) return;
-
-        const messages = this.messageStore.getAll();
-        if (messages.length > 0) {
-            console.log(`Attempting to republish ${messages.length} stored messages`);
-
-            for (const message of messages) {
-                const { routingKey, content, options } = message;
-
-                if (this.hasBindingForRoutingKey(routingKey)) {
-                    try {
-                        await this.channel.publish(
-                            this.options.connection.exchange as string,
-                            routingKey,
-                            content,
-                            options
-                        );
-                        console.log(`Successfully republished message to ${routingKey}`);
-                    } catch (error) {
-                        console.error(
-                            `Failed to republish message to ${routingKey}:`,
-                            error
-                        );
-                    }
-                } else {
-                    console.log(
-                        `No binding found for routing key ${routingKey}, keeping message in store`
-                    );
-                }
-            }
-        }
-    }
-
-    private hasBindingForRoutingKey(routingKey: string): boolean {
-        return Array.from(this.boundQueues).some((binding) => {
-            const pattern = binding
-                .replace(".", "\\.")
-                .replace("*", "[^.]+")
-                .replace("#", ".*");
-            const regex = new RegExp(`^${pattern}$`);
-            return regex.test(routingKey);
-        });
-    }
-
-    private handleUnroutableMessage(msg: ConsumeMessage): void {
-        console.log("Message returned as unroutable, storing for later delivery:", {
-            exchange: msg.fields.exchange,
-            routingKey: msg.fields.routingKey,
-            messageId: msg.properties.messageId,
-        });
-
-        this.messageStore.add(msg.fields.routingKey, msg.content, msg.properties);
     }
 
     private async connect(): Promise<void> {
@@ -240,40 +82,56 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
                 console.warn(
                     `Connection attempt ${this.reconnectAttempts} failed, retrying in ${this.RECONNECT_DELAY}ms`
                 );
-                await new Promise((resolve) =>
-                    setTimeout(resolve, this.RECONNECT_DELAY)
-                );
+                await new Promise((resolve) => setTimeout(resolve, this.RECONNECT_DELAY));
                 return this.connect();
             }
             throw error;
         }
     }
 
+    private async initializeHandlers(): Promise<void> {
+        if (!this.channel) throw new Error("Channel not initialized");
+
+        this.messageHandler = new MessageHandler(
+            this.channel,
+            this.idempotencyStore,
+            this.options,
+            {
+                maxRetries: this.MAX_RETRIES,
+                delays: this.RETRY_DELAYS,
+                retryExchange: this.options.connection.retryExchange,
+                deadLetterExchange: this.options.connection.deadLetterExchange,
+            }
+        );
+
+        this.deadLetterHandler = new DeadLetterHandler(
+            this.channel,
+            this.MAX_RETRIES,
+            this.options.connection.retryExchange
+        );
+    }
+
     private async setupExchangesAndQueues(): Promise<void> {
         if (!this.channel) throw new Error("Channel not initialized");
 
-        // Assert main exchange
-        await this.channel.assertExchange(
-            this.options.connection.exchange as string,
-            this.options.connection.exchangeType as string,
-            { durable: true }
-        );
+        await Promise.all([
+            this.channel.assertExchange(
+                this.options.connection.exchange,
+                this.options.connection.exchangeType,
+                { durable: true }
+            ),
+            this.channel.assertExchange(
+                this.options.connection.retryExchange,
+                "direct",
+                { durable: true }
+            ),
+            this.channel.assertExchange(
+                this.options.connection.deadLetterExchange,
+                "topic",
+                { durable: true }
+            )
+        ]);
 
-        // Assert retry exchange
-        await this.channel.assertExchange(
-            this.options.connection.retryExchange as string,
-            "direct",
-            { durable: true }
-        );
-
-        // Assert dead letter exchange
-        await this.channel.assertExchange(
-            this.options.connection.deadLetterExchange as string,
-            "topic",
-            { durable: true }
-        );
-
-        // Create DLQ
         const dlqName = `${this.options.connection.exchange}.dlq`;
         await this.channel.assertQueue(dlqName, {
             durable: true,
@@ -283,179 +141,71 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
                 "x-overflow": "reject-publish",
             },
         });
-        console.log(`Ensured DLQ ${dlqName} exists`);
 
-        // Bind DLQ to dead letter exchange
         await this.channel.bindQueue(
             dlqName,
-            this.options.connection.deadLetterExchange as string,
+            this.options.connection.deadLetterExchange,
             "#"
         );
 
-        await this.setupDeadLetterConsumer(dlqName);
+        await this.deadLetterHandler?.setupDeadLetterConsumer(dlqName);
     }
 
     private setupEventHandlers(): void {
         if (!this.connection || !this.channel) return;
 
-        this.connection.on("error", this.handleConnectionError.bind(this));
-        this.connection.on("close", this.handleConnectionClosed.bind(this));
+        this.connection.on("error", this.connectionHandler.handleConnectionError.bind(this.connectionHandler));
+        this.connection.on("close", this.connectionHandler.handleConnectionClosed.bind(this.connectionHandler));
 
-        this.channel.on("error", this.handleChannelError.bind(this));
-        this.channel.on("close", this.handleChannelClosed.bind(this));
+        this.channel.on("error", this.connectionHandler.handleChannelError.bind(this.connectionHandler));
+        this.channel.on("close", this.connectionHandler.handleChannelClosed.bind(this.connectionHandler));
         this.channel.on("return", this.handleUnroutableMessage.bind(this));
     }
 
-    private async handleConnectionError(error: Error): Promise<void> {
-        console.error("Connection error:", error);
-        await this.reconnect();
+    private handleUnroutableMessage(msg: ConsumeMessage): void {
+        console.log("Message returned as unroutable, storing for later delivery:", {
+            exchange: msg.fields.exchange,
+            routingKey: msg.fields.routingKey,
+            messageId: msg.properties.messageId,
+        });
+
+        this.messageStore.add(msg.fields.routingKey, msg.content, msg.properties);
     }
 
-    private async handleConnectionClosed(): Promise<void> {
-        console.warn("Connection closed, attempting to reconnect...");
-        await this.reconnect();
-    }
-
-    private async handleChannelError(error: Error): Promise<void> {
-        console.error("Channel error:", error);
-        await this.recreateChannel();
-    }
-
-    private async handleChannelClosed(): Promise<void> {
-        console.warn("Channel closed, attempting to recreate...");
-        await this.recreateChannel();
-    }
-
-    private async reconnect(): Promise<void> {
-        this.isInitialized = false;
-        try {
-            await this.init();
-        } catch (error) {
-            console.error("Failed to reconnect:", error);
-            setTimeout(() => this.reconnect(), this.RECONNECT_DELAY);
-        }
-    }
-
-    private async recreateChannel(): Promise<void> {
-        try {
-            if (!this.connection) throw new Error("No connection available");
-            this.channel = await this.connection.createChannel();
-            await this.setupExchangesAndQueues();
-            console.log("Channel recreated successfully");
-        } catch (error) {
-            console.error("Failed to recreate channel:", error);
-            await this.reconnect();
-        }
-    }
-
-    private async setupDeadLetterConsumer(dlqName: string): Promise<void> {
+    private async republishStoredMessages(): Promise<void> {
         if (!this.channel) return;
 
-        await this.channel.consume(
-            dlqName,
-            async (msg) => {
-                if (!msg) return;
+        const messages = this.messageStore.getAll();
+        if (messages.length === 0) return;
 
+        console.log(`Attempting to republish ${messages.length} stored messages`);
+
+        for (const message of messages) {
+            const { routingKey, content, options } = message;
+
+            if (this.hasBindingForRoutingKey(routingKey)) {
                 try {
-                    const details = this.extractDeadLetterDetails(msg);
-                    await this.handleDeadLetter(details);
-                    await this.channel?.ack(msg);
+                    await this.channel.publish(
+                        this.options.connection.exchange,
+                        routingKey,
+                        content,
+                        options
+                    );
+                    console.log(`Successfully republished message to ${routingKey}`);
                 } catch (error) {
-                    console.error("Error processing dead letter:", error);
-                    await this.channel?.reject(msg, false);
+                    console.error(`Failed to republish message to ${routingKey}:`, error);
                 }
-            },
-            { noAck: false }
-        );
-    }
-
-    private extractDeadLetterDetails(msg: ConsumeMessage): DeadLetterDetails {
-        const headers = msg.properties.headers || {};
-        const deathInfo = headers["x-death"]?.[0] || ({} as any);
-
-        return {
-            messageId: msg.properties.messageId || "unknown",
-            failureReason: headers["x-failure-reason"] || "Unknown failure",
-            retryCount: headers["x-retry-count"] || 0,
-            timestamp: new Date().toISOString(),
-            originalExchange: deathInfo.exchange || "",
-            originalRoutingKey: deathInfo.routingKey || "",
-            content: msg.content.toString(),
-            headers: headers,
-            error: headers["x-error-message"]
-                ? new Error(headers["x-error-message"])
-                : undefined,
-        };
-    }
-
-    private async handleDeadLetter(details: DeadLetterDetails): Promise<void> {
-        console.error("Dead Letter Processing:", {
-            messageId: details.messageId,
-            failureReason: details.failureReason,
-            retryCount: details.retryCount,
-            timestamp: details.timestamp,
-        });
-
-        if (this.shouldAttemptRecovery(details)) {
-            await this.attemptMessageRecovery(details);
-        } else {
-            await this.notifyDeadLetter(details);
-            this.incrementDeadLetterMetrics(details);
+            }
         }
     }
 
-    private shouldAttemptRecovery(details: DeadLetterDetails): boolean {
-        const recoverableErrors = ["ConnectionError", "TimeoutError"];
-        return (
-            recoverableErrors.includes(details.error?.name || "") &&
-            details.retryCount < this.MAX_RETRIES
-        );
-    }
-
-    private async attemptMessageRecovery(
-        details: DeadLetterDetails
-    ): Promise<void> {
-        if (!this.channel) throw new Error("Channel not initialized");
-
-        try {
-            await this.channel.publish(
-                this.options.connection.retryExchange as string,
-                details.originalRoutingKey,
-                Buffer.from(details.content),
-                {
-                    headers: {
-                        ...details.headers,
-                        "x-retry-count": details.retryCount + 1,
-                        "x-recovery-attempt": true,
-                        "x-original-error": details.error?.message,
-                    },
-                }
-            );
-
-            console.log(
-                `Recovery attempt initiated for message ${details.messageId}`
-            );
-        } catch (error) {
-            console.error("Recovery attempt failed:", error);
-            throw error;
-        }
-    }
-
-    private async notifyDeadLetter(details: DeadLetterDetails): Promise<void> {
-        console.log("Dead Letter Notification:", {
-            messageId: details.messageId,
-            failureReason: details.failureReason,
-            retryCount: details.retryCount,
-            timestamp: details.timestamp,
-        });
-    }
-
-    private incrementDeadLetterMetrics(details: DeadLetterDetails): void {
-        console.log("Dead Letter Metrics:", {
-            routingKey: details.originalRoutingKey,
-            exchange: details.originalExchange,
-            failureReason: details.failureReason,
-            retryCount: details.retryCount,
+    private hasBindingForRoutingKey(routingKey: string): boolean {
+        return Array.from(this.boundQueues).some((binding) => {
+            const pattern = binding
+                .replace(".", "\\.")
+                .replace("*", "[^.]+")
+                .replace("#", ".*");
+            return new RegExp(`^${pattern}$`).test(routingKey);
         });
     }
 
@@ -464,10 +214,7 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
         options?: PublishOptions
     ): Promise<void> {
         this.validateState();
-
-        if (!this.channel) {
-            throw new Error('Channel not initialized');
-        }
+        if (!this.channel) throw new Error("Channel not initialized");
 
         const content = Buffer.from(JSON.stringify(event));
         const messageId = event.metadata.id || uuid();
@@ -475,36 +222,34 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
 
         try {
             const published = await this.channel.publish(
-                this.options.connection.exchange as string,
+                this.options.connection.exchange,
                 event.type,
                 content,
                 {
                     persistent: this.options.producer.persistent,
                     mandatory: this.options.producer.mandatory,
-                    messageId, // Garantir un ID unique
+                    messageId,
                     timestamp,
                     headers: {
-                        'x-event-id': messageId, // ID dupliqué dans les headers pour plus de sécurité
+                        'x-event-id': messageId,
                         'x-published-timestamp': timestamp,
                         'x-correlation-id': event.metadata.correlationId,
                         'x-source': event.metadata.source,
-                        'x-deduplication-id': `${event.type}-${messageId}`, // ID de déduplication composite
+                        'x-deduplication-id': `${event.type}-${messageId}`,
                         ...options?.headers
                     },
                     ...options
-                });
+                }
+            );
 
             if (!published) {
                 throw new Error('Message was not confirmed by the broker');
             }
-
         } catch (error) {
-            const wrappedError = new MessageProcessingError(
+            throw new MessageProcessingError(
                 `Failed to publish event ${messageId}`,
                 error as Error
             );
-            console.error('Publication error:', wrappedError);
-            throw wrappedError;
         }
     }
 
@@ -514,9 +259,8 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
         options?: SubscribeOptions
     ): Promise<void> {
         this.validateState();
-
-        if (!this.channel) {
-            throw new Error("Channel not initialized");
+        if (!this.channel || !this.messageHandler) {
+            throw new Error("Channel or message handler not initialized");
         }
 
         const types = Array.isArray(type) ? type : [type];
@@ -537,20 +281,19 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
             for (const eventType of types) {
                 await this.channel.bindQueue(
                     queue,
-                    this.options.connection.exchange as string,
+                    this.options.connection.exchange,
                     eventType
                 );
                 this.boundQueues.add(eventType);
-                console.log(`Bound queue ${queue} to event type ${eventType}`);
             }
 
-            await this.channel.prefetch(this.options.consumer.prefetch as number);
+            await this.channel.prefetch(this.options.consumer.prefetch);
 
             await this.channel.consume(
                 queue,
                 async (msg) => {
                     if (!msg) return;
-                    await this.handleMessage(msg, handler);
+                    await this.messageHandler?.handleMessage(msg, handler);
                 },
                 { noAck: false }
             );
@@ -562,141 +305,26 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
         }
     }
 
-    private async handleMessage<T>(
-        msg: ConsumeMessage,
-        handler: (event: CloudEvent<T, E>) => Promise<void>
-    ): Promise<void> {
-        if (!this.channel) throw new Error("Channel not initialized");
-
-        const messageId =
-            msg.properties.messageId ||
-            msg.properties.headers?.["x-event-id"] ||
-            "unknown";
-        const retryCount =
-            (msg.properties.headers?.["x-retry-count"] as number) || 0;
-        const startTime = Date.now();
-
+    private async reconnect(): Promise<void> {
+        this.isInitialized = false;
         try {
-            // Vérifier si le message a déjà été traité
-            const { processed, result } =
-                await this.idempotencyStore.hasBeenProcessed(messageId);
-
-            if (processed) {
-                console.log(`[${messageId}] Message already processed, skipping`);
-                await this.channel.ack(msg);
-                return;
-            }
-
-            // Si le message n'a pas été traité, continuer le traitement normal
-            const event = JSON.parse(msg.content.toString()) as CloudEvent<T, E>;
-            console.log(
-                `[${messageId}] Processing message (attempt ${retryCount + 1}/${this.MAX_RETRIES + 1
-                })`
-            );
-
-            await handler(event);
-
-            // Marquer le message comme traité après succès
-            await this.idempotencyStore.markAsProcessed(messageId);
-
-            const processTime = Date.now() - startTime;
-            console.log(
-                `[${messageId}] Successfully processed message in ${processTime}ms`
-            );
-
-            if (!this.options.consumer.autoAck) {
-                await this.channel.ack(msg);
-            }
+            await this.init();
         } catch (error) {
-            const processTime = Date.now() - startTime;
-
-            if (error instanceof RetryableError && retryCount < this.MAX_RETRIES) {
-                await this.handleRetryableError(msg, error, retryCount);
-            } else {
-                await this.handleNonRetryableError(msg, error as Error);
-            }
-
-            console.error(
-                `[${messageId}] Message processing failed after ${processTime}ms:`,
-                error
-            );
+            console.error("Failed to reconnect:", error);
+            setTimeout(() => this.reconnect(), this.RECONNECT_DELAY);
         }
     }
 
-    private async handleRetryableError(
-        msg: ConsumeMessage,
-        error: Error,
-        retryCount: number
-    ): Promise<void> {
-        if (!this.channel) return;
-
-        const nextRetryDelay = this.RETRY_DELAYS[retryCount];
-        const headers = {
-            ...msg.properties.headers,
-            "x-retry-count": retryCount + 1,
-            "x-last-retry-timestamp": Date.now(),
-            "x-next-retry-delay": nextRetryDelay,
-            "x-last-error": error.message,
-            "x-error-stack": error.stack,
-        };
-
+    private async recreateChannel(): Promise<void> {
         try {
-            await new Promise((resolve) => setTimeout(resolve, nextRetryDelay));
-
-            const published = await this.channel.publish(
-                this.options.connection.retryExchange as string,
-                msg.fields.routingKey,
-                msg.content,
-                { ...msg.properties, headers }
-            );
-
-            if (published) {
-                await this.channel.ack(msg);
-                console.log(
-                    `Message requeued for retry ${retryCount + 1}/${this.MAX_RETRIES}`
-                );
-            } else {
-                throw new Error("Failed to publish retry message");
-            }
-        } catch (retryError) {
-            console.error("Failed to handle retryable error:", retryError);
-            await this.handleNonRetryableError(msg, error);
-        }
-    }
-
-    private async handleNonRetryableError(
-        msg: ConsumeMessage,
-        error: Error
-    ): Promise<void> {
-        if (!this.channel) return;
-
-        const headers = {
-            ...msg.properties.headers,
-            "x-failure-reason": error.message,
-            "x-failed-timestamp": Date.now(),
-            "x-error-type": error.name,
-            "x-error-stack": error.stack,
-            "x-original-exchange": msg.fields.exchange,
-            "x-original-routing-key": msg.fields.routingKey,
-        };
-
-        try {
-            const published = await this.channel.publish(
-                this.options.connection.deadLetterExchange as string,
-                "dead.letter",
-                msg.content,
-                { ...msg.properties, headers }
-            );
-
-            if (published) {
-                await this.channel.ack(msg);
-                console.log(`Message moved to DLQ: ${msg.properties.messageId}`);
-            } else {
-                throw new Error("Failed to publish to DLQ");
-            }
-        } catch (dlqError) {
-            console.error("Failed to move message to DLQ:", dlqError);
-            await this.channel.reject(msg, false);
+            if (!this.connection) throw new Error("No connection available");
+            this.channel = await this.connection.createChannel();
+            await this.setupExchangesAndQueues();
+            await this.initializeHandlers();
+            console.log("Channel recreated successfully");
+        } catch (error) {
+            console.error("Failed to recreate channel:", error);
+            await this.reconnect();
         }
     }
 
@@ -727,12 +355,10 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
             this.isInitialized = false;
             console.log("RabbitMQ EventBus closed successfully");
         } catch (error) {
-            const wrappedError = new MessageProcessingError(
+            throw new MessageProcessingError(
                 "Failed to close RabbitMQ connection",
                 error as Error
             );
-            console.error("Close error:", wrappedError);
-            throw wrappedError;
         }
     }
 }
