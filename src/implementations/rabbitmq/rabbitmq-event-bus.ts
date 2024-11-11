@@ -344,6 +344,8 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
 
     async close(): Promise<void> {
         try {
+            this.idempotencyStore.dispose();
+
             if (this.channel) {
                 await this.channel.close();
                 this.channel = undefined;
