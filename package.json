@@ -5,7 +5,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "jest",
     "build": "tsc",
     "version": "npm version"
   },
@@ -18,17 +18,30 @@
     "event-bus",
     "nodejs",
     "event-driven",
-    "architecture"
+    "architecture",
+    "ampq",
+    "rabbitmq",
+    "rabbit",
+    "bus",
+    "message-queue",
+    "queue",
+    "publish",
+    "subscribe",
+    "typescript"
   ],
   "author": "Abdou-Raouf ATARMLA <achilleatarmla@gmail.com>",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "amqplib": "^0.10.3",
     "uuid": "^9.0.0"
   },
   "devDependencies": {
     "@types/amqplib": "^0.10.1",
+    "@types/jest": "^29.5.14",
     "@types/uuid": "^9.0.1",
-    "typescript": "^5.6.3"
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.6.3",
+     "ts-node": "^10.9.2"
   }
 }
