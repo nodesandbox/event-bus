@@ -4,6 +4,9 @@
   "description": "A RabbitMQ-based event management library for Node.js, providing message publishing, subscription, and rerouting of unroutable messages with support for persistence and idempotency.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "jest",
     "build": "tsc",
