@@ -1,7 +1,7 @@
 {
-  "name": "@digitaltg/event-bus",
+  "name": "@nodesandbox/event-bus",
   "version": "0.1.0",
-  "description": "A lightweight library to overwrap the way event are handled in nodejs using modern tools",
+  "description": "A RabbitMQ-based event management library for Node.js, providing message publishing, subscription, and rerouting of unroutable messages with support for persistence and idempotency.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
