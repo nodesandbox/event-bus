@@ -15,6 +15,7 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
     private channel?: Channel;
     private readonly options: ValidatedEventBusOptions;
     private isInitialized = false;
+    private disableReconnection: boolean = false;
     private reconnectAttempts = 0;
     private messageStore: MessageStore;
     private boundQueues: Set<string>;
@@ -42,6 +43,10 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
             this.reconnect.bind(this),
             this.recreateChannel.bind(this)
         );
+    }
+
+    public setDisableReconnection(value: boolean): void {
+        this.disableReconnection = value;
     }
 
     private validateState(): void {
@@ -78,7 +83,7 @@ export class RabbitMQEventBus<E extends string = string> implements EventBus<E> 
             console.log("Connected to RabbitMQ successfully");
         } catch (error) {
             this.reconnectAttempts++;
-            if (this.reconnectAttempts < this.MAX_RECONNECT_ATTEMPTS) {
+            if (!this.disableReconnection && this.reconnectAttempts < this.MAX_RECONNECT_ATTEMPTS) {
                 console.warn(
                     `Connection attempt ${this.reconnectAttempts} failed, retrying in ${this.RECONNECT_DELAY}ms`
                 );
