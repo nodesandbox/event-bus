@@ -1,6 +1,6 @@
 {
   "name": "@nodesandbox/event-bus",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A RabbitMQ-based event management library for Node.js, providing message publishing, subscription, and rerouting of unroutable messages with support for persistence and idempotency.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -45,6 +45,6 @@
     "jest": "^29.7.0",
     "ts-jest": "^29.2.5",
     "typescript": "^5.6.3",
-     "ts-node": "^10.9.2"
+    "ts-node": "^10.9.2"
   }
 }
